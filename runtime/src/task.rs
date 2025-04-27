@@ -4,6 +4,7 @@ use crate::core::widget;
 use crate::futures::futures::channel::mpsc;
 use crate::futures::futures::channel::oneshot;
 use crate::futures::futures::future::{self, FutureExt};
+use crate::futures::futures::select;
 use crate::futures::futures::stream::{self, Stream, StreamExt};
 use crate::futures::{BoxStream, MaybeSend, boxed_stream};
 
@@ -170,6 +171,82 @@ impl<T> Task<T> {
                     units: self.units + task.units,
                 },
             },
+        }
+    }
+
+    /// Zips two tasks together. The zipped task waits for both tasks to produce an output,
+    /// and then produces that pair.
+    pub fn zip<U>(self, other: Task<U>) -> Task<(T, U)>
+    where
+        T: MaybeSend + 'static,
+        U: MaybeSend + 'static,
+    {
+        let streams = match (self.stream, other.stream) {
+            (None, None) => return Task::none(),
+            (Some(stream), None) => return Task::stream(stream).discard(),
+            (None, Some(stream)) => return Task::stream(stream).discard(),
+            (Some(first), Some(second)) => (first.fuse(), second.fuse()),
+        };
+
+        let stream = stream::unfold(
+            (streams, Some((None, None))),
+            move |(mut streams, outputs)| async move {
+                let Some((first, second)) = outputs else {
+                    // One of the streams is terminated.
+                    // Yield the rest actions of the another stream.
+                    let action = select! {
+                        action = streams.0.select_next_some() => action.output().err(),
+                        action = streams.1.select_next_some() => action.output().err(),
+                    };
+
+                    return action.map(|action| {
+                        (Some(action), (streams, Some((None, None))))
+                    });
+                };
+
+                let Some(first) = first else {
+                    let Some(action) = streams.0.next().await else {
+                        return Some((None, (streams, None)));
+                    };
+
+                    return match action.output() {
+                        Ok(output) => {
+                            Some((None, (streams, Some((Some(output), second)))))
+                        }
+                        Err(action) => Some((
+                            Some(action),
+                            (streams, Some((first, second))),
+                        )),
+                    };
+                };
+
+                let Some(second) = second else {
+                    let Some(action) = streams.1.next().await else {
+                        return Some((None, (streams, None)));
+                    };
+
+                    return match action.output() {
+                        Ok(output) => {
+                            Some((None, (streams, Some((Some(first), Some(output))))))
+                        }
+                        Err(action) => Some((
+                            Some(action),
+                            (streams, Some((Some(first), second))),
+                        )),
+                    };
+                };
+
+                Some((
+                    Some(Action::Output((first, second))),
+                    (streams, Some((None, None))),
+                ))
+            },
+        )
+        .filter_map(future::ready);
+
+        Task {
+            stream: Some(boxed_stream(stream)),
+            units: self.units + other.units,
         }
     }
 
